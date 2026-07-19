@@ -4,11 +4,11 @@
 
 services:
   browser-gateway:
-    image: browser-gateway-browser-gateway:latest
+    build: .
     container_name: browser-gateway
     restart: always
     ports:
-      - "127.0.0.1:8000:8000"
+      - "8000:8000"
     volumes:
       - browser-profile:/data
     environment:
