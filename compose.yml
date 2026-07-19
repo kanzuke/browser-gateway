@@ -1,0 +1,28 @@
+services:
+
+  browser-gateway:
+
+    build: .
+
+    container_name: browser-gateway
+
+    restart: unless-stopped
+
+    shm_size: "2gb"
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+
+      - ./profiles:/profiles
+
+      - ./downloads:/downloads
+
+    environment:
+
+      PROFILE_PATH: /profiles/default
+
+      DOWNLOAD_PATH: /downloads
+
+      LOG_LEVEL: INFO
