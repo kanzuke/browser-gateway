@@ -1,0 +1,1 @@
+"""Browser Gateway — application package."""

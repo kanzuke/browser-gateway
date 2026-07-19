@@ -1,0 +1,26 @@
+# Browser Gateway - microservice de contournement anti-bot (DataDome/Cloudflare/etc.)
+# Deploy permanent: restart: always + profil persistant pour survivre aux reboot VPS.
+# Port 8000 expose l'API FastAPI (health/fetch/screenshot/warmup/identity).
+
+services:
+  browser-gateway:
+    image: browser-gateway-browser-gateway:latest
+    container_name: browser-gateway
+    restart: always
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - browser-profile:/data
+    environment:
+      - LOG_LEVEL=INFO
+      - BROWSER_HEADLESS=false
+      - BROWSER_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  browser-profile:
