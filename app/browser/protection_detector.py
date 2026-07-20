@@ -1,5 +1,9 @@
 """ProtectionDetector — détecte les protections anti-bot sur une page chargée.
 
+V2.1 — juillet 2026: DataDome cookie seul ne suffit plus pour signaler un blocage.
+  Le cookie datadome est posé sur tout visiteur légitime — il ne signifie un blocage
+  que s'il est accompagné d'un status >= 400 ou d'une page de challenge DataDome.
+
 Version initiale : DataDome, Cloudflare, PerimeterX, Akamai.
 """
 
@@ -19,16 +23,18 @@ class ProtectionDetector:
     la présence de solutions anti-bot connues. Retourne une structure normalisée.
     """
 
-    # Signatures DataDome
-    _DATADOME_COOKIE_PATTERNS = [r"datadome"]
+    # Signatures DataDome — challenge page (pas le cookie de tracking)
     _DATADOME_HTML_PATTERNS = [
-        r"datadome\.co",
+        r"datadome\\.co",
         r"dd://",
-        r'cdn\.datadome\.co',
-        r"_dd",
+        r"cdn\\.datadome\\.co",
+        r"var\\s+dd\\s*=",
         r"DataDome",
+        r"dd\\.cid",
     ]
-    _DATADOME_URL_PATTERNS = [r"datadome\.co"]
+    _DATADOME_URL_PATTERNS = [r"datadome\\.co"]
+    # Cookie qui indique un BLOCAGE (pas le cookie de tracking)
+    # DataDome pose 'datadome' sur tous les visiteurs — ce n'est pas un signal de blocage
 
     # Signatures Cloudflare
     _CLOUDFLARE_COOKIE_PATTERNS = [r"cf_clearance", r"__cf_bm"]
@@ -57,8 +63,6 @@ class ProtectionDetector:
         return [re.compile(p, re.IGNORECASE) for p in patterns]
 
     def __init__(self) -> None:
-        # Pré-compile les regex pour la performance
-        self._datadome_cookie_re = self._compile(self._DATADOME_COOKIE_PATTERNS)
         self._datadome_html_re = self._compile(self._DATADOME_HTML_PATTERNS)
         self._datadome_url_re = self._compile(self._DATADOME_URL_PATTERNS)
         self._cf_cookie_re = self._compile(self._CLOUDFLARE_COOKIE_PATTERNS)
@@ -128,16 +132,27 @@ class ProtectionDetector:
         cookies: list[dict[str, str]],
         final_url: str,
     ) -> bool:
-        # Cookie DataDome
-        for cookie in cookies:
-            name = cookie.get("name", "")
-            if any(r.search(name) for r in self._datadome_cookie_re):
-                return True
-        # HTML signatures (DataDome bloque souvent avec 403 + page spécifique)
-        if status == 403 and any(r.search(html) for r in self._datadome_html_re):
+        """Détecte un blocage DataDome.
+
+        Le cookie 'datadome' est posé sur tous les visiteurs légitimes — sa seule
+        présence ne signifie PAS un blocage. On ne signale un blocage que si:
+        - status >= 400 ET le HTML contient des signatures DataDome (challenge page)
+        - OU l'URL finale est une redirection vers datadome.co
+        """
+        # URL de redirection DataDome — toujours un blocage
+        if final_url and any(r.search(final_url) for r in self._datadome_url_re):
             return True
-        # URL de redirection DataDome
-        return bool(final_url and any(r.search(final_url) for r in self._datadome_url_re))
+
+        # Status >= 400 + signatures HTML DataDome = challenge/blocage
+        if status >= 400 and any(r.search(html) for r in self._datadome_html_re):
+            return True
+
+        # Status 403 spécifique à DataDome (page de challenge avec var dd=)
+        if status == 403 and "var dd=" in html:
+            return True
+
+        # Sinon, pas de blocage (le cookie seul n'est pas un signal)
+        return False
 
     def _check_cloudflare(
         self,

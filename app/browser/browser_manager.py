@@ -2,6 +2,8 @@
 
 Responsabilités : démarrer/arrêter Chromium, créer contextes, ouvrir pages,
 restaurer les profils persistants. Aucune logique métier ici.
+
+V2.0 — juillet 2026: extra HTTP headers, accept language, color scheme.
 """
 
 from __future__ import annotations
@@ -60,7 +62,20 @@ class BrowserManager:
             },
             "locale": "fr-FR",
             "timezone_id": "Europe/Paris",
+            "color_scheme": "light",
             "ignore_default_args": ["--enable-automation"],
+            "extra_http_headers": {
+                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            },
         }
         if self._s.browser_executable_path:
             launch_kwargs["executable_path"] = self._s.browser_executable_path
@@ -77,7 +92,7 @@ class BrowserManager:
         # add_init_script s'exécute avant tout code page/frame, ce qui est critique
         # pour masquer navigator.webdriver et autres fingerprints d'automation.
         await self._context.add_init_script(STEALTH_INIT_SCRIPT)
-        logger.info("Scripts stealth injectés (anti-DataDome/Cloudflare)")
+        logger.info("Scripts stealth injectés (anti-DataDome/Cloudflare) — V2.0")
 
         self._running = True
         logger.info("Chromium démarré avec succès")
@@ -124,7 +139,6 @@ class BrowserManager:
         if not self._context:
             return []
         cookies = await self._context.cookies()
-        # Normalise en dict simple pour nos modèles
         return [
             {"name": c.get("name", ""), "value": c.get("value", ""), "domain": c.get("domain", "")}
             for c in cookies

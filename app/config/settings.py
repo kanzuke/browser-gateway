@@ -21,7 +21,13 @@ class Settings(BaseSettings):
     browser_profile_dir: Path = Path("/data/browser-profile")
     browser_executable_path: str = ""
     browser_launch_args: str = (
-        "--disable-blink-features=AutomationControlled --no-sandbox"
+        "--disable-blink-features=AutomationControlled "
+        "--no-sandbox "
+        "--disable-dev-shm-usage "
+        "--disable-features=IsolateOrigins,site-per-process "
+        "--disable-infobars "
+        "--window-size=1920,1080 "
+        "--start-maximized"
     )
     browser_viewport_width: int = 1920
     browser_viewport_height: int = 1080

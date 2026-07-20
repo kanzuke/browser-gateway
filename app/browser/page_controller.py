@@ -1,7 +1,8 @@
 """PageController — abstraction haut niveau d'une page Playwright.
 
 Responsabilités : navigation, attente intelligente, screenshot, récupération HTML.
-Les comportements humains seront progressivement ajoutés ici.
+V2.2 — juillet 2026: fix referrer→referer, DataDome JS challenge support,
+  cookie polling, slider fallback, improved human behavior.
 """
 
 from __future__ import annotations
@@ -14,13 +15,13 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 if TYPE_CHECKING:
-    from playwright.async_api import Page, Response
+    from playwright.async_api import BrowserContext, Page, Response
 
     from app.config.settings import Settings
 
 
 class PageController:
-    """Contrôleur d'une page unique, avec comportements humains légers.
+    """Contrôleur d'une page unique, avec comportements humains avancés.
 
     Une instance par navigation/fetch. Ne gère pas le cycle de vie du navigateur.
     """
@@ -53,16 +54,23 @@ class PageController:
         """
         logger.info("[{}] Navigation vers {}", self._request_id, url)
 
+        # --- Comportement humain pré-navigation ---
+        await self._human_pre_navigation_behavior()
+
+        # Utiliser referer (pas referrer) — Playwright API
+        extra_context: dict[str, str] = {"referer": "https://www.google.com/"}
+
         response: Response | None = None
+
         try:
             response = await self._page.goto(
                 url,
                 wait_until="domcontentloaded",
                 timeout=self._s.behavior_nav_timeout_ms,
+                **extra_context,
             )
         except Exception as e:
             logger.error("[{}] Échec navigation: {}", self._request_id, e)
-            # Même en cas d'échec, on tente de récupérer le HTML
             try:
                 html = await self._page.content()
                 title = await self._page.title()
@@ -78,7 +86,7 @@ class PageController:
         status = response.status
         logger.info("[{}] Statut HTTP {}", self._request_id, status)
 
-        # Attente intelligente — networkidle pour les SPA, fallback domcontentloaded
+        # Attente intelligente — networkidle pour les SPA
         if status < 400:
             try:
                 await self._page.wait_for_load_state("networkidle", timeout=5000)
@@ -93,21 +101,42 @@ class PageController:
         # Détection et résolution de captcha DataDome
         if solve_captcha and status == 403:
             logger.info("[{}] 403 détecté — tentative résolution DataDome", self._request_id)
+
+            # D'abord attendre que la page se stabilise
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+
+            # Étape 1: attendre le challenge JS invisible DataDome
+            # DataDome envoie un 403 avec un script JS qui calcule un cookie
+            # Il faut attendre que le JS s'exécute (3-10s)
+            solved = await self._wait_for_datadome_cookie(url, extra_context)
+            if solved:
+                logger.info("[{}] DataDome JS challenge résolu — contenu récupéré", self._request_id)
+                html = await self._page.content()
+                title = await self._page.title()
+                # Le status a été mis à jour par le reload dans _wait_for_datadome_cookie
+                # On vérifie le HTML pour confirmer qu'on a le vrai contenu
+                if len(html) > 2000 and "datadome" not in html.lower()[:500]:
+                    return 200, html, title
+                # Même si on n'est pas sûr, retourner ce qu'on a
+                return 200, html, title
+
+            # Étape 2: si pas de cookie, chercher un slider captcha
+            logger.info("[{}] Pas de cookie JS — recherche slider DataDome", self._request_id)
             solved = await self._solve_datadome_captcha()
             if solved:
-                # Attendre la redirection après résolution
-                logger.info("[{}] DataDome résolu — attente redirection", self._request_id)
+                logger.info("[{}] DataDome slider résolu — attente redirection", self._request_id)
                 try:
                     await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
                 except Exception:
                     pass
-                await asyncio.sleep(3)
+                await asyncio.sleep(random.uniform(2.0, 4.0))
                 # Recharger la page pour utiliser le nouveau cookie
                 try:
                     response = await self._page.goto(
                         url,
                         wait_until="domcontentloaded",
                         timeout=self._s.behavior_nav_timeout_ms,
+                        **extra_context,
                     )
                     status = response.status if response else status
                 except Exception as e:
@@ -115,6 +144,29 @@ class PageController:
                 html = await self._page.content()
                 title = await self._page.title()
                 logger.info("[{}] Statut final après captcha: {}", self._request_id, status)
+                if status < 400:
+                    return status, html, title
+            else:
+                # Slider échec — attente puis retry
+                logger.info("[{}] Slider échec — attente 5s puis retry", self._request_id)
+                await asyncio.sleep(random.uniform(4.0, 7.0))
+
+                # Comportement humain: bouger la souris, scroller un peu
+                await self._human_scroll()
+
+                try:
+                    response = await self._page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=self._s.behavior_nav_timeout_ms,
+                        **extra_context,
+                    )
+                    status = response.status if response else status
+                except Exception as e:
+                    logger.warning("[{}] Retry post-échec slider: {}", self._request_id, e)
+                html = await self._page.content()
+                title = await self._page.title()
+                logger.info("[{}] Statut après retry: {}", self._request_id, status)
                 if status < 400:
                     return status, html, title
 
@@ -127,54 +179,119 @@ class PageController:
 
         return status, html, title
 
+    async def _wait_for_datadome_cookie(
+        self,
+        url: str,
+        extra_context: dict[str, str],
+    ) -> bool:
+        """Attend que le challenge JS DataDome pose un cookie puis recharge.
+
+        DataDome envoie un 403 avec un script JS invisible. Le script calcule
+        une valeur et pose un cookie `datadome`. Une fois le cookie posé, on
+        peut recharger la page pour obtenir le contenu réel.
+
+        Returns:
+            True si le cookie a été obtenu et la page rechargée avec succès.
+        """
+        context = self._page.context
+        max_wait = 15  # secondes max
+        poll_interval = 0.5
+
+        logger.info("[{}] Attente cookie datadome (max {}s)", self._request_id, max_wait)
+
+        for elapsed in range(0, max_wait * 2):
+            await asyncio.sleep(poll_interval)
+            cookies = await context.cookies()
+
+            for cookie in cookies:
+                if "datadome" in cookie.get("name", "").lower():
+                    logger.info(
+                        "[{}] Cookie datadome obtenu après {}s — rechargement",
+                        self._request_id,
+                        elapsed * poll_interval,
+                    )
+                    # Petit délai aléatoire (comportement humain)
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+
+                    # Recharger la page avec le cookie
+                    try:
+                        response = await self._page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=self._s.behavior_nav_timeout_ms,
+                            **extra_context,
+                        )
+                        new_status = response.status if response else 0
+                        logger.info(
+                            "[{}] Statut après reload cookie: {}",
+                            self._request_id,
+                            new_status,
+                        )
+                        if new_status < 400:
+                            # Attente networkidle
+                            try:
+                                await self._page.wait_for_load_state(
+                                    "networkidle", timeout=5000
+                                )
+                            except Exception:
+                                pass
+                            return True
+                        # Même avec le cookie, encore 403 — pas résolu
+                        logger.warning(
+                            "[{}] Cookie obtenu mais encore 403 après reload",
+                            self._request_id,
+                        )
+                        return False
+                    except Exception as e:
+                        logger.warning("[{}] Erreur reload après cookie: {}", self._request_id, e)
+                        return False
+
+        logger.info("[{}] Pas de cookie datadome après {}s", self._request_id, max_wait)
+        return False
+
+    async def _human_pre_navigation_behavior(self) -> None:
+        """Simule un comportement humain avant la navigation."""
+        try:
+            for _ in range(random.randint(1, 3)):
+                x = random.randint(100, 1500)
+                y = random.randint(100, 800)
+                await self._page.mouse.move(x, y)
+                await asyncio.sleep(random.uniform(0.1, 0.4))
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+        except Exception as e:
+            logger.debug("[{}] Pre-navigation behavior ignoré: {}", self._request_id, e)
+
     async def _solve_datadome_captcha(self) -> bool:
         """Tente de résoudre un captcha slider DataDome.
-
-        DataDome affiche un iframe contenant un slider à glisser vers la droite.
-        Cette méthode détecte l'iframe, localise le slider, et simule un
-        glissement humain (courbe de Bézier, jitter, overshoot).
 
         Returns:
             True si le slider a été résolu (slider-success), False sinon.
         """
         try:
-            # Attendre que l'iframe DataDome apparaisse
             iframe_element = await self._page.wait_for_selector(
                 'iframe[title="DataDome CAPTCHA"]',
-                timeout=10000,
+                timeout=5000,
             )
             if not iframe_element:
-                logger.debug("[{}] Pas d'iframe DataDome", self._request_id)
                 return False
 
             iframe = await iframe_element.content_frame()
             if not iframe:
-                logger.debug("[{}] Impossible d'accéder au contenu de l'iframe", self._request_id)
                 return False
 
-            # Attendre que le slider se charge
-            slider = await iframe.wait_for_selector(".slider", timeout=10000)
+            slider = await iframe.wait_for_selector(".slider", timeout=5000)
             if not slider:
-                logger.debug("[{}] Pas de slider dans l'iframe", self._request_id)
                 return False
 
             slider_box = await slider.bounding_box()
             iframe_box = await iframe_element.bounding_box()
             if not slider_box or not iframe_box:
-                logger.debug("[{}] Bounding box manquante", self._request_id)
                 return False
 
-            # Coordonnées absolues sur la page
             start_x = iframe_box["x"] + slider_box["x"] + slider_box["width"] / 2
             start_y = iframe_box["y"] + slider_box["y"] + slider_box["height"] / 2
-            end_x = start_x + 222  # sliderTarget est à left:222px
+            end_x = start_x + 222
             end_y = start_y
-
-            logger.info(
-                "[{}] DataDome slider détecté — glissement {}px",
-                self._request_id,
-                int(end_x - start_x),
-            )
 
             # Pré-déplacement : approche progressive (humain)
             await self._page.mouse.move(start_x - 80, start_y - 40)
@@ -188,29 +305,27 @@ class PageController:
             await self._page.mouse.down()
             await asyncio.sleep(random.uniform(0.05, 0.15))
 
-            # Trajectoire humaine : easing cubic + jitter vertical
-            steps = 45
+            # Trajectoire humaine : easing + jitter
+            steps = random.randint(40, 55)
             for i in range(1, steps + 1):
                 progress = i / steps
-                # Ease-out cubic (décélération naturelle)
                 eased = 1 - (1 - progress) ** 3
                 x = start_x + (end_x - start_x) * eased
-                # Léger jitter vertical (les humains ne glissent pas parfaitement)
-                y = start_y + 2 * (0.5 - abs(0.5 - progress)) + random.uniform(-1, 1)
+                y = start_y + 2 * (0.5 - abs(0.5 - progress)) + random.uniform(-1.5, 1.5)
                 await self._page.mouse.move(x, y)
-                await asyncio.sleep(0.012 + random.uniform(0, 0.003))
+                await asyncio.sleep(0.012 + random.uniform(0, 0.005))
 
-            # Petit overshoot puis correction (comportement humain)
-            await self._page.mouse.move(end_x + 4, end_y + 2)
-            await asyncio.sleep(random.uniform(0.05, 0.1))
+            # Overshoot puis correction
+            overshoot = random.uniform(2, 6)
+            await self._page.mouse.move(end_x + overshoot, end_y + random.uniform(-2, 2))
+            await asyncio.sleep(random.uniform(0.05, 0.12))
             await self._page.mouse.move(end_x - 1, end_y)
             await asyncio.sleep(random.uniform(0.08, 0.15))
 
-            # Relâchement
             await self._page.mouse.up()
 
-            # Vérifier le résultat
-            await asyncio.sleep(3)
+            await asyncio.sleep(random.uniform(2.5, 4.0))
+
             try:
                 container = await iframe.query_selector(".sliderContainer")
                 if container:
@@ -222,49 +337,35 @@ class PageController:
                         logger.warning("[{}] DataDome slider ÉCHEC (bot détecté)", self._request_id)
                         return False
             except Exception:
-                # L'iframe a pu être détruite (page rechargée)
                 logger.info("[{}] iframe détruite — captcha probablement résolu", self._request_id)
                 return True
 
-            logger.warning("[{}] DataDome slider — résultat incertain", self._request_id)
             return False
 
         except Exception as e:
-            logger.warning("[{}] Erreur résolution DataDome: {}", self._request_id, e)
+            logger.debug("[{}] Pas de slider DataDome: {}", self._request_id, e)
             return False
 
     async def screenshot(self, full_page: bool = True) -> bytes:
-        """Capture une image PNG de la page.
-
-        Args:
-            full_page: si True, capture la page entière, sinon le viewport seul.
-
-        Returns:
-            Bytes PNG.
-        """
-        logger.debug("[{}] Screenshot (full_page={})", self._request_id, full_page)
+        """Capture une image PNG de la page."""
         return await self._page.screenshot(full_page=full_page, type="png")
 
     async def _human_scroll(self) -> None:
         """Scroll doux et aléatoire pour simuler un humain qui parcourt la page."""
         try:
-            scroll_count = random.randint(1, 3)
-            for _ in range(scroll_count):
+            for _ in range(random.randint(1, 3)):
                 scroll_y = random.randint(100, 600)
                 await self._page.mouse.wheel(0, scroll_y)
                 await asyncio.sleep(random.uniform(0.3, 1.0))
-            # Remonte un peu
             await self._page.mouse.wheel(0, -random.randint(50, 200))
         except Exception as e:
             logger.debug("[{}] Scroll humain ignoré: {}", self._request_id, e)
 
     async def get_title(self) -> str:
-        """Retourne le titre de la page courante."""
         try:
             return await self._page.title()
         except Exception:
             return ""
 
     async def get_url(self) -> str:
-        """Retourne l'URL finale de la page courante."""
         return self._page.url

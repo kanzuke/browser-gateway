@@ -1,5 +1,6 @@
 # Browser Gateway - microservice de contournement anti-bot (DataDome/Cloudflare/etc.)
 # Inclut Xvfb pour mode headed (requis par DataDome — headless est détecté).
+# V2.0 — juillet 2026: ajout fonts supplémentaires, shm_size config.
 
 FROM python:3.13-slim
 
@@ -8,7 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libasound2 libpangocairo-1.0-0 libpango-1.0-0 \
     libcairo2 libatspi2.0-0 libxshmfence1 libwoff1 libopus0 libwebp7 \
-    fonts-liberation wget ca-certificates \
+    fonts-liberation fonts-noto-cjk fonts-noto-color-emoji \
+    wget ca-certificates \
     libcups2 \
     xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
